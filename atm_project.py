@@ -39,10 +39,30 @@ def load_data():
                 engine="fastparquet", 
                 columns=["advance_id", "repaid_full_30d"]
             ),
-            "transactions": pd.read_parquet("transactions_sample.parquet", engine="fastparquet")
         }
-        print("All data loaded successfully.")
+        
+        # --- NEW: Load and combine all transaction files ---
+        print("Loading and combining transaction files...")
+        txn_files = [
+            "transactions_sample.parquet",
+            "transactions_sample_2.parquet",
+            "transactions_sample_3.parquet",
+            "transactions_sample_4.parquet"
+        ]
+        all_txns = []
+        for f in txn_files:
+            try:
+                all_txns.append(pd.read_parquet(f, engine="fastparquet"))
+            except FileNotFoundError:
+                print(f"Warning: File {f} not found. Skipping.")
+        
+        if not all_txns:
+            raise FileNotFoundError("No transaction files found.")
+            
+        data["transactions"] = pd.concat(all_txns, ignore_index=True)
+        print(f"All data loaded successfully. Combined {len(all_txns)} transaction files.")
         return data
+        
     except FileNotFoundError as e:
         print(f"Error: {e}. Make sure all .parquet files are in the same directory.")
         return None
@@ -67,7 +87,7 @@ def get_base_table(df_labels, df_advances):
     return first_advances_df
 
 def create_application_features(base_df, df_applications):
-    """Engineers features from applications *before* underwriting."""
+    """Engineers simplified features from applications *before* underwriting."""
     print("Engineering pre-underwriting application features...")
     df_applications['created_at'] = pd.to_datetime(df_applications['created_at'])
     
@@ -104,7 +124,7 @@ def create_application_features(base_df, df_applications):
 
 def create_balance_features(features_df, df_balances):
     """
-    Engineers features from balance snapshots *before* underwriting.
+    Engineers simplified features from balance snapshots *before* underwriting.
     --- SIMPLIFIED: ONLY USES LATEST SNAPSHOT ---
     """
     print("Engineering simplified pre-underwriting balance features...")
@@ -128,7 +148,6 @@ def create_balance_features(features_df, df_balances):
     print(f"Found {len(pre_balances)} pre-underwriting balance snapshots for {pre_balances['user_id'].nunique()} users.")
     
     if not pre_balances.empty:
-        # 1. Get *most recent* snapshot features
         pre_balances_sorted = pre_balances.sort_values(by=['user_id', 'updated_at'], ascending=True)
         latest_pre_balances = pre_balances_sorted.drop_duplicates(subset=['user_id'], keep='last').copy()
         
@@ -143,8 +162,56 @@ def create_balance_features(features_df, df_balances):
             'current_balance': 'last_current_balance'
         })
         
-        # Merge all new balance features
         features_df = features_df.merge(balance_features_last, on='user_id', how='left')
+
+    return features_df
+
+def create_transaction_features(features_df, df_transactions):
+    """
+    Engineers simplified features from transactions *before* underwriting.
+    --- SIMPLIFIED: NO PIVOTS, NO TRENDS, NO STD/MIN/MAX ---
+    """
+    print("Engineering simplified pre-underwriting transaction features...")
+    df_transactions['date'] = pd.to_datetime(df_transactions['date'])
+    
+    df_txns_merged = df_transactions.merge(
+        features_df[['user_id', 'underwritten_at']], 
+        on='user_id', 
+        how='inner'
+    )
+    
+    # --- 🛡️ LEAKAGE CHECK 🛡️ ---
+    pre_txns = df_txns_merged[
+        df_txns_merged['date'] < df_txns_merged['underwritten_at']
+    ].copy()
+    
+    if not pre_txns.empty:
+        assert (pre_txns['date'] < pre_txns['underwritten_at']).all(), \
+            "Data Leakage Detected in Transactions!"
+            
+    print(f"Found {len(pre_txns)} pre-underwriting transactions from {pre_txns['user_id'].nunique()} users.")
+    
+    if not pre_txns.empty:
+        # 1. Inflow/Outflow amounts
+        pre_txns['inflow'] = pre_txns['amount'].apply(lambda x: x if x < 0 else 0).abs()
+        pre_txns['outflow'] = pre_txns['amount'].apply(lambda x: x if x > 0 else 0)
+        
+        # 2. Days from transaction to underwriting
+        pre_txns['days_before_underwriting'] = (
+            pre_txns['underwritten_at'] - pre_txns['date']
+        ).dt.days
+        
+        # 3. Aggregate simple features by user
+        txn_agg_features = pre_txns.groupby('user_id').agg(
+            pre_txn_count=('id', 'count'),
+            pre_txn_net_sum=('amount', 'sum'), # This is NET flow
+            pre_txn_inflow_sum=('inflow', 'sum'),
+            pre_txn_outflow_sum=('outflow', 'sum'),
+            pre_txn_user_history_days=('days_before_underwriting', 'max'),
+            pre_txn_days_since_last=('days_before_underwriting', 'min')
+        )
+        
+        features_df = features_df.merge(txn_agg_features, on='user_id', how='left')
 
     return features_df
 
@@ -162,6 +229,12 @@ def finalize_features(features_df):
     safe_div = 1e-6 # To avoid division by zero
     features_df['balance_ratio'] = features_df.get('last_available_balance', 0) / (features_df.get('last_current_balance', 0) + safe_div)
     
+    # Txn Ratios
+    features_df['pre_txn_inflow_ratio_sum'] = features_df.get('pre_txn_inflow_sum', 0) / (features_df.get('pre_txn_inflow_sum', 0) + features_df.get('pre_txn_outflow_sum', 0) + safe_div)
+    features_df['pre_txn_avg_txns_per_day'] = features_df.get('pre_txn_count', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div)
+    features_df['pre_txn_avg_net_flow_per_day'] = features_df.get('pre_txn_net_sum', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div)
+
+    
     y = features_df['repaid_full_30d'].astype(int)
     
     cols_to_drop = [
@@ -178,11 +251,6 @@ def finalize_features(features_df):
     cols_to_drop = [col for col in cols_to_drop if col in all_cols]
     
     X = features_df.drop(columns=cols_to_drop)
-    
-    # --- Feature Selection: Drop columns that are all 0 (from skipped txn step) ---
-    non_zero_cols = (X != 0).any(axis=0)
-    cols_to_keep = X.columns[non_zero_cols]
-    X = X[cols_to_keep]
     
     X = X.fillna(0)
     X.columns = X.columns.astype(str)
@@ -272,6 +340,9 @@ def main():
     base_df = get_base_table(data["labels"], data["advances"])
     features_df = create_application_features(base_df, data["applications"])
     features_df = create_balance_features(features_df, data["balances"])
+    
+    # --- RE-ENABLED: Using simplified transaction feature function ---
+    features_df = create_transaction_features(features_df, data["transactions"])
     
     X, y = finalize_features(features_df)
     
