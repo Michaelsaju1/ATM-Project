@@ -7,9 +7,11 @@ from sklearn.model_selection import train_test_split, cross_val_score, KFold
 from lightgbm import LGBMClassifier
 from sklearn.metrics import classification_report, average_precision_score
 import warnings
+import optuna
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 def load_data():
@@ -90,8 +92,7 @@ def create_application_features(base_df, df_applications):
         ].copy()
 
     if not pre_apps.empty:
-        assert (pre_apps['created_at'] < pre_apps['underwritten_at']).all(), \
-            "Data Leakage Detected in Applications!"
+        assert (pre_apps['created_at'] < pre_apps['underwritten_at']).all(), "Data Leakage Detected in Applications!"
 
     print(f"Found {len(pre_apps)} pre-underwriting applications.")
 
@@ -277,8 +278,8 @@ def calculate_precision_at_k(y_true, y_proba, k_values):
 
 
 def evaluate_model(X, y):
-    """Runs cross-validation and test-set evaluation for LightGBM."""
-    print("\n--- Model Evaluation (LightGBM Only) ---")
+    """Runs Optuna tuning and test-set evaluation for LightGBM."""
+    print("\n--- Model Evaluation (LightGBM with Optuna Tuning) ---")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y,
@@ -287,18 +288,61 @@ def evaluate_model(X, y):
         stratify=y
     )
 
-    model = LGBMClassifier(random_state=42, n_estimators=100, verbosity=-1, num_leaves=31)
+    print("\n--- Starting Optuna Hyperparameter Tuning ---")
 
-    print("\n--- 5-Fold Cross-Validation (PR AUC) ---")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring='average_precision', n_jobs=-1)
-    print(f"LGBM: Mean PR AUC = {cv_scores.mean():.4f} (Std = {cv_scores.std():.4f})")
+    def objective(trial, X_train, y_train):
+        """Optuna objective function"""
+        # Define hyperparameter search space
+        params = {
+            'objective': 'binary',
+            'metric': 'average_precision',
+            'verbosity': -1,
+            'random_state': 42,
+            'n_jobs': -1,  # Use all available cores
+            'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=50),
+            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 20, 80),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+        }
 
-    print("\n--- Test Set Performance ---")
+        model = LGBMClassifier(**params)
 
-    k_values = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
+        # Evaluate model using cross-validation
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        cv_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring='average_precision', n_jobs=-1)
 
-    print(f"\n--- Training and Evaluating: LightGBM ---")
+        return cv_scores.mean()
+
+    # Create a study and run optimization
+    study = optuna.create_study(direction='maximize')
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50,
+                   show_progress_bar=True)  # You can change n_trials
+
+    print(f"\nOptuna: Best Mean CV PR AUC = {study.best_value:.4f}")
+    print(f"Optuna: Best Parameters = {study.best_params}")
+
+    best_tuned_params = study.best_params
+
+    print("\n--- Test Set Performance (with Tuned Model) ---")
+
+    k_values = np.round(np.arange(0.10, 0.95, 0.05), 2)
+
+    print(f"\n--- Training and Evaluating: Tuned LightGBM ---")
+
+    # Combine best params with static params for the final model
+    model = LGBMClassifier(
+        **best_tuned_params,
+        objective='binary',
+        metric='average_precision',
+        random_state=42,
+        verbosity=-1,
+        n_jobs=-1
+    )
+
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_test)
@@ -308,23 +352,23 @@ def evaluate_model(X, y):
     print(classification_report(y_test, y_pred))
     print(f"PR AUC (AUPRC): {pr_auc:.4f}")
 
-    print("\n\n--- Final Target Metric: Precision at K Cutoffs ---")
+    print("\n--- Final Target Metric: Precision at K Cutoffs ---")
     precision_scores = calculate_precision_at_k(y_test, y_proba, k_values)
-    precision_df = pd.DataFrame(precision_scores, index=["LightGBM"]).T
+    precision_df = pd.DataFrame(precision_scores, index=["Tuned LightGBM"]).T
     print(precision_df.to_markdown(floatfmt=".2%"))
 
-    print("\n--- Feature Importances ---")
+    print("\n--- Feature Importances (Tuned Model) ---")
 
     importances = model.feature_importances_
     feature_imp = pd.Series(importances, index=X.columns).nlargest(20)
 
     plt.figure(figsize=(10, 8))
     sns.barplot(x=feature_imp.values, y=feature_imp.index)
-    plt.title("LightGBM - Top 20 Feature Importances")
+    plt.title("LightGBM - Top 20 Feature Importances (Tuned Model)")
     plt.xlabel("Importance")
     plt.ylabel("Feature")
     plt.tight_layout()
-    plt.savefig("lgbm_feature_importance.png")
+    plt.savefig("lgbm_feature_importance_tuned.png")
     plt.show()
 
 
