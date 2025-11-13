@@ -1,3 +1,6 @@
+import json
+import os
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,6 +16,8 @@ import optuna
 warnings.filterwarnings('ignore')
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# JSON file for saving hyperparameters
+PARAMS_FILE = 'best_lgbm_hyperparameters.json'
 
 def load_data():
     """Loads all source parquet files into a dictionary of DataFrames."""
@@ -288,44 +293,59 @@ def evaluate_model(X, y):
         stratify=y
     )
 
-    print("\n--- Starting Optuna Hyperparameter Tuning ---")
+    if os.path.exists(PARAMS_FILE):
+        print(f"\n--- Found {PARAMS_FILE}. Loading hyperparameters and skipping tuning. ---")
+        with open(PARAMS_FILE, 'r') as f:
+            best_tuned_params = json.load(f)
+        print(f"Loaded parameters: {best_tuned_params}")
 
-    def objective(trial, X_train, y_train):
-        """Optuna objective function"""
-        # Define hyperparameter search space
-        params = {
-            'objective': 'binary',
-            'metric': 'average_precision',
-            'verbosity': -1,
-            'random_state': 42,
-            'n_jobs': -1,  # Use all available cores
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=50),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 20, 80),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-        }
+    else:
+        print(f"\n--- {PARAMS_FILE} not found. Starting Optuna Hyperparameter Tuning. ---")
 
-        model = LGBMClassifier(**params)
+        def objective(trial, X_train, y_train):
+            """Optuna objective function"""
+            # Define hyperparameter search space
+            params = {
+                'objective': 'binary',
+                'metric': 'average_precision',
+                'verbosity': -1,
+                'random_state': 42,
+                'n_jobs': -1,  # Use all available cores
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=50),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 80),
+                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+            }
 
-        # Evaluate model using cross-validation
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring='average_precision', n_jobs=-1)
+            model = LGBMClassifier(**params)
 
-        return cv_scores.mean()
+            # Evaluate model using cross-validation
+            kf = KFold(n_splits=5, shuffle=True, random_state=42)
+            cv_scores = cross_val_score(model, X_train, y_train, cv=kf, scoring='average_precision', n_jobs=-1)
 
-    # Create a study and run optimization
-    study = optuna.create_study(direction='maximize')
-    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50,
-                   show_progress_bar=True)  # You can change n_trials
+            return cv_scores.mean()
 
-    print(f"\nOptuna: Best Mean CV PR AUC = {study.best_value:.4f}")
-    print(f"Optuna: Best Parameters = {study.best_params}")
+        # Create a study and run optimization
+        study = optuna.create_study(direction='maximize')
+        study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=100,
+                       show_progress_bar=True)
 
-    best_tuned_params = study.best_params
+        print(f"\nOptuna: Best Mean CV PR AUC = {study.best_value:.4f}")
+        print(f"Optuna: Best Parameters = {study.best_params}")
+
+        best_tuned_params = study.best_params
+
+        print(f"\nSaving best parameters to {PARAMS_FILE}...")
+        try:
+            with open(PARAMS_FILE, 'w') as f:
+                json.dump(best_tuned_params, f, indent=4)
+            print("Parameters saved successfully.")
+        except Exception as e:
+            print(f"Error saving parameters: {e}")
 
     print("\n--- Test Set Performance (with Tuned Model) ---")
 
