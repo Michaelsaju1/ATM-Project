@@ -1,3 +1,4 @@
+#With crap ton of features and R2 regression
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -114,9 +115,9 @@ def create_application_features(base_df, df_applications):
         ).dt.days
         
         app_agg_features = pre_apps.groupby('user_id').agg(
-            pre_app_count=('created_at', 'count'),
-            days_since_first_pre_app=('days_before_underwrite', 'max'),
-            days_since_last_pre_app=('days_before_underwrite', 'min')
+            pre_app_count=('created_at', 'count'), # This user applied 5 times before you count
+            days_since_first_pre_app=('days_before_underwrite', 'max'), # Number of days before underwriting correspondign to their very first application
+            days_since_last_pre_app=('days_before_underwrite', 'min') # The number of days to their last application
         )
         base_df = base_df.merge(app_agg_features, on='user_id', how='left')
 
@@ -149,17 +150,17 @@ def create_balance_features(features_df, df_balances):
     
     if not pre_balances.empty:
         pre_balances_sorted = pre_balances.sort_values(by=['user_id', 'updated_at'], ascending=True)
-        latest_pre_balances = pre_balances_sorted.drop_duplicates(subset=['user_id'], keep='last').copy()
+        latest_pre_balances = pre_balances_sorted.drop_duplicates(subset=['user_id'], keep='last').copy() #This basically just gets the most recent balance snapshot right before underwriting
         
         latest_pre_balances['days_since_last_balance'] = (
             latest_pre_balances['underwritten_at'] - latest_pre_balances['updated_at']
-        ).dt.days
+        ).dt.days # time between how stale that snapshot was (difference in days when the loan was underwrtitten and when this last balance snapshot was taken)
         
         balance_features_last = latest_pre_balances[[
             'user_id', 'available_balance', 'current_balance', 'days_since_last_balance'
         ]].rename(columns={
-            'available_balance': 'last_available_balance',
-            'current_balance': 'last_current_balance'
+            'available_balance': 'last_available_balance', #This is the available balance from that most recent snapshot
+            'current_balance': 'last_current_balance' #The current balance from that sames snapshot
         })
         
         features_df = features_df.merge(balance_features_last, on='user_id', how='left')
@@ -203,12 +204,12 @@ def create_transaction_features(features_df, df_transactions):
         
         # 3. Aggregate simple features by user
         txn_agg_features = pre_txns.groupby('user_id').agg(
-            pre_txn_count=('id', 'count'),
-            pre_txn_net_sum=('amount', 'sum'), # This is NET flow
-            pre_txn_inflow_sum=('inflow', 'sum'),
-            pre_txn_outflow_sum=('outflow', 'sum'),
-            pre_txn_user_history_days=('days_before_underwriting', 'max'),
-            pre_txn_days_since_last=('days_before_underwriting', 'min')
+            pre_txn_count=('id', 'count'), #Total number of transactions that a user had in their history before underwriting
+            pre_txn_net_sum=('amount', 'sum'), # This is NET flow (inflow -outflow)
+            pre_txn_inflow_sum=('inflow', 'sum'), # Money coming in
+            pre_txn_outflow_sum=('outflow', 'sum'), # Sum of all withdrawals
+            pre_txn_user_history_days=('days_before_underwriting', 'max'), #Age f the user's latest transaction
+            pre_txn_days_since_last=('days_before_underwriting', 'min') #recency calculated by how recently they transacted before the loan decision.
         )
         
         features_df = features_df.merge(txn_agg_features, on='user_id', how='left')
@@ -219,20 +220,20 @@ def finalize_features(features_df):
     """Cleans up the final feature set for modeling."""
     print("Finalizing feature set...")
     
-    features_df['underwrite_month'] = features_df['underwritten_at'].dt.month
-    features_df['underwrite_dayofweek'] = features_df['underwritten_at'].dt.dayofweek
-    features_df['underwrite_hour'] = features_df['underwritten_at'].dt.hour
+    #features_df['underwrite_month'] = features_df['underwritten_at'].dt.month
+    #features_df['underwrite_dayofweek'] = features_df['underwritten_at'].dt.dayofweek
+    #features_df['underwrite_hour'] = features_df['underwritten_at'].dt.hour
     
     features_df['amount'] = pd.to_numeric(features_df['amount'].replace(r'[^\\d\\.]', '', regex=True), errors='coerce')
     
     # --- New Ratio Features (Post-Merge) ---
     safe_div = 1e-6 # To avoid division by zero
-    features_df['balance_ratio'] = features_df.get('last_available_balance', 0) / (features_df.get('last_current_balance', 0) + safe_div)
+    features_df['balance_ratio'] = features_df.get('last_available_balance', 0) / (features_df.get('last_current_balance', 0) + safe_div) # ratio of user's available balance to their current balance; a low ration could indicate risk
     
     # Txn Ratios
-    features_df['pre_txn_inflow_ratio_sum'] = features_df.get('pre_txn_inflow_sum', 0) / (features_df.get('pre_txn_inflow_sum', 0) + features_df.get('pre_txn_outflow_sum', 0) + safe_div)
-    features_df['pre_txn_avg_txns_per_day'] = features_df.get('pre_txn_count', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div)
-    features_df['pre_txn_avg_net_flow_per_day'] = features_df.get('pre_txn_net_sum', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div)
+    features_df['pre_txn_inflow_ratio_sum'] = features_df.get('pre_txn_inflow_sum', 0) / (features_df.get('pre_txn_inflow_sum', 0) + features_df.get('pre_txn_outflow_sum', 0) + safe_div) #indicates whether a person is a net saver or net spender (value below .5 means that they spend more moeny than they bring in)
+    features_df['pre_txn_avg_txns_per_day'] = features_df.get('pre_txn_count', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div) # avg number of transactions per day. 10 transactions per day is very different and higher risk that 2 trnsaction per week
+    features_df['pre_txn_avg_net_flow_per_day'] = features_df.get('pre_txn_net_sum', 0) / (features_df.get('pre_txn_user_history_days', 0) + safe_div) #net financial change (inflow - outflow) averaged over their transaction history. It basically gets th burn rate or the savings rate. A negative value means that on an average day, the user's account balance drops by 10.
 
     
     y = features_df['repaid_full_30d'].astype(int)
@@ -298,20 +299,20 @@ def evaluate_model(X, y):
         
     print("\n--- Test Set Performance ---")
     
-    k_values = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35]
+    k_values = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]
     
     print(f"\n--- Training and Evaluating: LightGBM ---")
     model.fit(X_train, y_train)
     
     y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+    y_proba = model.predict_proba(X_test)[:, 1] #This is where we get the predictions that a user will repay
     
     pr_auc = average_precision_score(y_test, y_proba)
     print(classification_report(y_test, y_pred))
     print(f"PR AUC (AUPRC): {pr_auc:.4f}")
     
     # --- Display Precision at K Results Table ---
-    print("\n\n--- 🎯 FINAL TARGET METRIC: Precision at K Cutoffs ---")
+    print("\n\n--- Final Target Metric: Precision at K Cutoffs ---")
     precision_scores = calculate_precision_at_k(y_test, y_proba, k_values)
     precision_df = pd.DataFrame(precision_scores, index=["LightGBM"]).T
     print(precision_df.to_markdown(floatfmt=".2%"))
