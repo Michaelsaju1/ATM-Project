@@ -331,7 +331,7 @@ def evaluate_model(X, y):
 
         # Create a study and run optimization
         study = optuna.create_study(direction='maximize')
-        study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=300,
+        study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=150,
                        show_progress_bar=True)
 
         print(f"\nOptuna: Best Mean CV PR AUC = {study.best_value:.4f}")
